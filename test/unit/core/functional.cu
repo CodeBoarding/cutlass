@@ -34,6 +34,9 @@
 
 #include "../common/cutlass_unit_test.h"
 
+#include <cmath>
+#include <limits>
+
 #include "cutlass/functional.h"
 #include "cutlass/core_io.h"
 
@@ -566,3 +569,93 @@ TEST(FUnction, maximum_half_device) {
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace test {
+namespace core {
+namespace kernel {
+
+template <typename Operator>
+__global__ void warp_abs_max(float *output, float const *input) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  output[idx] = Operator{}(input[idx]);
+}
+
+} // namespace kernel
+
+/// Check every lane, not only lane zero: the public functors promise a broadcast result.
+template <int Width, typename Operator>
+void check_warp_abs_max() {
+  using Tensor = cutlass::HostTensor<float, cutlass::layout::RowMajor>;
+  constexpr int count = 128;
+  Tensor input({1, count});
+  Tensor output({1, count});
+
+  // Distinct magnitudes and signs distinguish neighboring half-warps, warps, and blocks.
+  // Move the maximum through every position to catch a missing shuffle stage.
+  for (int peak = 0; peak < Width; ++peak) {
+    for (int i = 0; i < count; ++i) {
+      input.host_data()[i] = float((i % 7) - 3);
+      if (i % Width == peak) {
+        input.host_data()[i] = -float(100 + i / Width);
+      }
+    }
+    input.sync_device();
+    kernel::warp_abs_max<Operator><<<2, 64>>>(output.device_data(), input.device_data());
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    output.sync_host();
+    for (int i = 0; i < count; ++i) {
+      EXPECT_EQ(output.host_data()[i], float(100 + i / Width)) << "lane " << i;
+    }
+  }
+
+  // A NaN in either half must propagate only within its reduction group.
+  for (int nan_lane = 0; nan_lane < 32; ++nan_lane) {
+    for (int i = 0; i < count; ++i) {
+      input.host_data()[i] = -float(i + 1);
+    }
+    input.host_data()[nan_lane] = std::numeric_limits<float>::quiet_NaN();
+    input.sync_device();
+    kernel::warp_abs_max<Operator><<<2, 64>>>(output.device_data(), input.device_data());
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    output.sync_host();
+    for (int i = 0; i < count; ++i) {
+      if (i / Width == nan_lane / Width) {
+        EXPECT_TRUE(std::isnan(output.host_data()[i])) << "lane " << i;
+      }
+      else {
+        EXPECT_EQ(output.host_data()[i], float((i / Width + 1) * Width)) << "lane " << i;
+      }
+    }
+  }
+
+  // Alternate negative infinity and signed zeros in adjacent groups.
+  for (int i = 0; i < count; ++i) {
+    input.host_data()[i] = i % 2 ? -0.0f : 0.0f;
+    if (i % (2 * Width) == Width - 1) {
+      input.host_data()[i] = -std::numeric_limits<float>::infinity();
+    }
+  }
+  input.sync_device();
+  kernel::warp_abs_max<Operator><<<2, 64>>>(output.device_data(), input.device_data());
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  output.sync_host();
+  for (int i = 0; i < count; ++i) {
+    float expected = (i / Width) % 2 ? 0.0f : std::numeric_limits<float>::infinity();
+    EXPECT_EQ(output.host_data()[i], expected) << "lane " << i;
+    EXPECT_FALSE(std::signbit(output.host_data()[i])) << "lane " << i;
+  }
+}
+
+} // namespace core
+} // namespace test
+
+TEST(Functional, warp_abs_max_nan) {
+  test::core::check_warp_abs_max<32, cutlass::redux_abs_max_nan_propagation_sync_warp<float>>();
+}
+
+TEST(Functional, half_warp_abs_max_nan) {
+  test::core::check_warp_abs_max<16, cutlass::redux_abs_max_nan_propagation_sync_warp_t0t15_t16t31<float>>();
+}

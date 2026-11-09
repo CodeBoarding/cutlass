@@ -36,6 +36,7 @@
 #pragma once
 
 #include "cutlass/cutlass.h"
+#include "cutlass/arch/warp_reduce.h"
 #include "cutlass/numeric_types.h"
 #include "cutlass/platform/platform.h"
 #include "cutlass/detail/dependent_false.hpp"
@@ -55,11 +56,6 @@
 #include <ciso646>
 #include <intrin.h>
 #endif // _MSC_VER
-
-#if defined(CUTLASS_ARCH_MMA_SM100A_ENABLED) || defined(CUTLASS_ARCH_MMA_SM100F_ENABLED) ||\
-    defined(CUTLASS_ARCH_MMA_SM103A_ENABLED) || defined(CUTLASS_ARCH_MMA_SM103F_ENABLED)
-#  define CUTLASS_ARCH_CREDUX_ENABLED
-#endif
 
 namespace cutlass {
 
@@ -1054,21 +1050,11 @@ struct redux_abs_max_nan_propagation_sync_warp <float>{
   CUTLASS_DEVICE
   float operator()(float const &lhs) const {
 #if defined(CUTLASS_ARCH_CREDUX_ENABLED)
-    float result;
-    asm volatile("redux.sync.max.abs.NaN.f32 %0, %1, 0xffffffff;\n" : "=f"(result) : "f"(lhs));
-    return result;
+    return arch::redux_abs_max_nan_sync(lhs);
 #elif defined(__CUDA_ARCH__)
-    cutlass::maximum<float, /*PropagateNaN*/true> max_op;
-    int shuffle_width = 32;
-    float abs_max = cutlass::absolute_value_op<float>{}(lhs);
-    CUTLASS_PRAGMA_UNROLL
-    for(int offset = shuffle_width / 2; offset > 0; offset /= 2) {
-      float value = __shfl_down_sync(0xffffffff, abs_max, offset, shuffle_width);
-      abs_max = max_op(abs_max,value);
-    }
-    // Broadcast the maximum to all threads participating in the reduction.
-    abs_max = __shfl_sync(0xffffffff, abs_max, 0, shuffle_width);
-    return abs_max;
+    return arch::warp_reduce<32>(
+      cutlass::absolute_value_op<float>{}(lhs),
+      cutlass::maximum<float, /*PropagateNaN*/true>{});
 #else
     CUTLASS_UNUSED(lhs);
     CUTLASS_NOT_IMPLEMENTED();
@@ -1095,17 +1081,9 @@ struct redux_abs_max_nan_propagation_sync_warp_t0t15_t16t31<float>{
     return first_half_threads ? v0: v1;
     
 #elif defined(__CUDA_ARCH__)
-    float abs_max = cutlass::absolute_value_op<float>{}(max);
-    cutlass::maximum<float, /*PropagateNaN*/true> max_op;
-    constexpr int shuffle_width = 16;
-    CUTLASS_PRAGMA_UNROLL
-    for(int offset = shuffle_width/2; offset > 0; offset /= 2) {
-      float value = __shfl_down_sync(0xffffffff, abs_max, offset, shuffle_width);
-        abs_max  = max_op(abs_max,value);
-    }
-    // Broadcast the maximum to all threads participating in the reduction.
-    abs_max = __shfl_sync(0xffffffff, abs_max, 0, shuffle_width);
-    return abs_max;
+    return arch::warp_reduce<16>(
+      cutlass::absolute_value_op<float>{}(max),
+      cutlass::maximum<float, /*PropagateNaN*/true>{});
 #else 
     CUTLASS_UNUSED(max);
     CUTLASS_NOT_IMPLEMENTED();
