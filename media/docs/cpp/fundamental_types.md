@@ -344,6 +344,54 @@ multiply_add<Array<half_t, kN>> mad_op;
 d = mad_op(a, b, c);   // efficient multiply-add for Array of half-precision elements
 ```
 
+### Warp and subgroup absolute maximum
+
+`redux_abs_max_nan_propagation_sync<float, Width>` computes the absolute maximum
+of each contiguous group of `Width` lanes and broadcasts it to every lane in
+that group. It is a device-only function object in `cutlass/functional.h`.
+Supported widths are 1, 2, 4, 8, 16, and 32. Invalid widths fail at compile time.
+
+All 32 lanes in each participating warp must execute the call. Width is a
+logical partition of a full warp, **not** an active-thread count: it does not
+make an incomplete warp or a divergent call safe. Groups follow CUDA lane
+ordering, including when a warp spans rows or planes of a multidimensional
+thread block. A block should contain a multiple of 32 threads.
+
+```c++
+#include "cutlass/functional.h"
+
+__global__ void group_abs_max(float const *input, float *output, int count) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  // Do not return early or predicate the collective on idx < count.
+  // Zero is the identity for absolute maximum, so tail lanes can contribute zero.
+  float value = idx < count ? input[idx] : 0.0f;
+  float amax = cutlass::redux_abs_max_nan_propagation_sync<float, 8>{}(value);
+  if (idx < count) {
+    output[idx] = amax;
+  }
+}
+// For count > 0, launch group_abs_max<<<(count + 127) / 128, 128>>>(...).
+```
+
+NaNs propagate only within their group; a NaN in lanes 0–7 does not affect
+lanes 8–15 for width 8. Negative inputs contribute their absolute values,
+negative infinity produces positive infinity, and either sign of zero produces
+positive zero. Subnormal inputs are preserved when compiling without
+flush-to-zero options. NaN payload preservation is not part of the contract.
+
+On architectures with native floating-point redux support, the implementation
+uses `redux.sync.max.abs.NaN.f32` with a lane-group member mask. Other CUDA
+targets use a down-shuffle tree followed by a broadcast. The group mask is
+derived from the hardware lane ID, not `threadIdx.x`, so the native path also
+handles 2D and 3D blocks. This API does not synchronize memory accesses.
+
+The existing `redux_abs_max_nan_propagation_sync_warp<float>` and
+`redux_abs_max_nan_propagation_sync_warp_t0t15_t16t31<float>` names remain
+available as the width-32 and width-16 forms. The SM100 block-scale column-store
+epilogue uses widths 16 and 32 directly. Its scale-vector-64 path still performs
+a separate shared-memory reduction between adjacent warps; this primitive does
+not communicate across warp boundaries.
+
 ## Numeric Conversion
 
 Operators are define to convert between numeric types in `numeric_conversion.h`. Conversion operators are defined in

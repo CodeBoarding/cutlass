@@ -31,6 +31,7 @@
 #pragma once
 
 #include "cutlass/cutlass.h"
+#include "cutlass/arch/arch.h"
 #include "cutlass/arch/config.h"
 #include <cuda_runtime.h>
 
@@ -67,13 +68,18 @@ float warp_reduce(float value, ReductionOp op) {
 #endif
 }
 
-/// Native warp-wide absolute maximum, with NaN propagation, on supported architectures.
-/// All 32 lanes must participate. Callers select the shuffle fallback on other architectures.
+/// Native absolute maximum for independent contiguous lane groups on supported architectures.
+/// All 32 lanes must participate. LaneId, rather than threadIdx.x, also supports 2D/3D blocks.
+template <int Width = 32>
 CUTLASS_DEVICE
 float redux_abs_max_nan_sync(float value) {
+  static_assert(Width > 0 && Width <= 32 && (Width & (Width - 1)) == 0,
+                "Warp reduction width must be a power of two between 1 and 32");
 #if defined(CUTLASS_ARCH_CREDUX_ENABLED)
+  unsigned int group_mask = (0xffffffffu >> (32 - Width)) << ((LaneId() / Width) * Width);
   float result;
-  asm volatile("redux.sync.max.abs.NaN.f32 %0, %1, 0xffffffff;\n" : "=f"(result) : "f"(value));
+  asm volatile("redux.sync.max.abs.NaN.f32 %0, %1, %2;\n"
+               : "=f"(result) : "f"(value), "r"(group_mask));
   return result;
 #else
   CUTLASS_UNUSED(value);

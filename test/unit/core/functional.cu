@@ -576,7 +576,8 @@ namespace kernel {
 
 template <typename Operator>
 __global__ void warp_abs_max(float *output, float const *input) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int thread = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+  int idx = blockIdx.x * (blockDim.x * blockDim.y * blockDim.z) + thread;
   output[idx] = Operator{}(input[idx]);
 }
 
@@ -584,7 +585,7 @@ __global__ void warp_abs_max(float *output, float const *input) {
 
 /// Check every lane, not only lane zero: the public functors promise a broadcast result.
 template <int Width, typename Operator>
-void check_warp_abs_max() {
+void check_warp_abs_max(dim3 block = dim3(64)) {
   using Tensor = cutlass::HostTensor<float, cutlass::layout::RowMajor>;
   constexpr int count = 128;
   Tensor input({1, count});
@@ -600,7 +601,7 @@ void check_warp_abs_max() {
       }
     }
     input.sync_device();
-    kernel::warp_abs_max<Operator><<<2, 64>>>(output.device_data(), input.device_data());
+    kernel::warp_abs_max<Operator><<<2, block>>>(output.device_data(), input.device_data());
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     output.sync_host();
@@ -616,7 +617,7 @@ void check_warp_abs_max() {
     }
     input.host_data()[nan_lane] = std::numeric_limits<float>::quiet_NaN();
     input.sync_device();
-    kernel::warp_abs_max<Operator><<<2, 64>>>(output.device_data(), input.device_data());
+    kernel::warp_abs_max<Operator><<<2, block>>>(output.device_data(), input.device_data());
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     output.sync_host();
@@ -638,7 +639,7 @@ void check_warp_abs_max() {
     }
   }
   input.sync_device();
-  kernel::warp_abs_max<Operator><<<2, 64>>>(output.device_data(), input.device_data());
+  kernel::warp_abs_max<Operator><<<2, block>>>(output.device_data(), input.device_data());
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
   output.sync_host();
@@ -647,6 +648,28 @@ void check_warp_abs_max() {
     EXPECT_EQ(output.host_data()[i], expected) << "lane " << i;
     EXPECT_FALSE(std::signbit(output.host_data()[i])) << "lane " << i;
   }
+
+  // Preserve subnormals; an absolute-max reduction must not silently flush them to zero.
+  for (int i = 0; i < count; ++i) {
+    input.host_data()[i] = -std::numeric_limits<float>::denorm_min() * float(i + 1);
+  }
+  input.sync_device();
+  kernel::warp_abs_max<Operator><<<2, block>>>(output.device_data(), input.device_data());
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  output.sync_host();
+  for (int i = 0; i < count; ++i) {
+    float expected = std::numeric_limits<float>::denorm_min() * float((i / Width + 1) * Width);
+    EXPECT_EQ(output.host_data()[i], expected) << "lane " << i;
+  }
+}
+
+template <int Width>
+void check_warp_abs_max_block_shapes() {
+  using Operator = cutlass::redux_abs_max_nan_propagation_sync<float, Width>;
+  check_warp_abs_max<Width, Operator>(dim3(64));
+  check_warp_abs_max<Width, Operator>(dim3(8, 8));
+  check_warp_abs_max<Width, Operator>(dim3(4, 4, 4));
 }
 
 } // namespace core
@@ -658,4 +681,28 @@ TEST(Functional, warp_abs_max_nan) {
 
 TEST(Functional, half_warp_abs_max_nan) {
   test::core::check_warp_abs_max<16, cutlass::redux_abs_max_nan_propagation_sync_warp_t0t15_t16t31<float>>();
+}
+
+TEST(Functional, subgroup_abs_max_nan_width1) {
+  test::core::check_warp_abs_max_block_shapes<1>();
+}
+
+TEST(Functional, subgroup_abs_max_nan_width2) {
+  test::core::check_warp_abs_max_block_shapes<2>();
+}
+
+TEST(Functional, subgroup_abs_max_nan_width4) {
+  test::core::check_warp_abs_max_block_shapes<4>();
+}
+
+TEST(Functional, subgroup_abs_max_nan_width8) {
+  test::core::check_warp_abs_max_block_shapes<8>();
+}
+
+TEST(Functional, subgroup_abs_max_nan_width16) {
+  test::core::check_warp_abs_max_block_shapes<16>();
+}
+
+TEST(Functional, subgroup_abs_max_nan_width32) {
+  test::core::check_warp_abs_max_block_shapes<32>();
 }

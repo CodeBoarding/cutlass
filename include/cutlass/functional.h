@@ -1042,17 +1042,23 @@ struct is_atomic<atomic_maximum<T>> : platform::true_type {};
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
 /// Parallel Synchronization and Communication Instructions
-template <typename T>
-struct redux_abs_max_nan_propagation_sync_warp;
+/// Absolute maximum in each contiguous Width-lane group, broadcast to every group member.
+/// Width must be a power of two in [1, 32]. All 32 lanes must execute the call.
+/// A NaN propagates within its group only; signed zeros produce positive zero.
+template <typename T, int Width>
+struct redux_abs_max_nan_propagation_sync;
 
-template <>
-struct redux_abs_max_nan_propagation_sync_warp <float>{
+template <int Width>
+struct redux_abs_max_nan_propagation_sync<float, Width> {
+  static_assert(Width > 0 && Width <= 32 && (Width & (Width - 1)) == 0,
+                "Warp reduction width must be a power of two between 1 and 32");
+
   CUTLASS_DEVICE
   float operator()(float const &lhs) const {
 #if defined(CUTLASS_ARCH_CREDUX_ENABLED)
-    return arch::redux_abs_max_nan_sync(lhs);
+    return arch::redux_abs_max_nan_sync<Width>(lhs);
 #elif defined(__CUDA_ARCH__)
-    return arch::warp_reduce<32>(
+    return arch::warp_reduce<Width>(
       cutlass::absolute_value_op<float>{}(lhs),
       cutlass::maximum<float, /*PropagateNaN*/true>{});
 #else
@@ -1063,34 +1069,21 @@ struct redux_abs_max_nan_propagation_sync_warp <float>{
   }
 };
 
+/// Backward-compatible full-warp spelling.
+template <typename T>
+struct redux_abs_max_nan_propagation_sync_warp;
+
+template <>
+struct redux_abs_max_nan_propagation_sync_warp<float>
+    : redux_abs_max_nan_propagation_sync<float, 32> {};
+
+/// Backward-compatible spelling for the two independent half-warps.
 template <typename T>
 struct redux_abs_max_nan_propagation_sync_warp_t0t15_t16t31;
 
 template <>
-struct redux_abs_max_nan_propagation_sync_warp_t0t15_t16t31<float>{
-  CUTLASS_DEVICE
-  float operator()(float const &max) const {
-#if defined(CUTLASS_ARCH_CREDUX_ENABLED)
-    int half_warp_idx = threadIdx.x / (NumThreadsPerWarp / 2);
-    bool first_half_threads = (half_warp_idx % 2) == 0;
-    float value0 =  first_half_threads ? max : 0;
-    float v0 = cutlass::redux_abs_max_nan_propagation_sync_warp<float>{}(value0);
-
-    float value1 = !first_half_threads ? max : 0;
-    float v1 = cutlass::redux_abs_max_nan_propagation_sync_warp<float>{}(value1);
-    return first_half_threads ? v0: v1;
-    
-#elif defined(__CUDA_ARCH__)
-    return arch::warp_reduce<16>(
-      cutlass::absolute_value_op<float>{}(max),
-      cutlass::maximum<float, /*PropagateNaN*/true>{});
-#else 
-    CUTLASS_UNUSED(max);
-    CUTLASS_NOT_IMPLEMENTED();
-    return 0;
-#endif
-  }
-};
+struct redux_abs_max_nan_propagation_sync_warp_t0t15_t16t31<float>
+    : redux_abs_max_nan_propagation_sync<float, 16> {};
 
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
