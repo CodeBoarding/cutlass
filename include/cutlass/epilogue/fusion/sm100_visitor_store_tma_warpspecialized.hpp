@@ -488,15 +488,12 @@ struct Sm100BlockScaleFactorColStore {
       // For VS32, t0~t31 should generate an amax.
       // For VS64, t0~t63 should generate an amax. We would first do the reduciton within a warp,
       //           and then use smem to do inter-warp reduction.
-      if constexpr (SFVecSize == 32) {
-        return cutlass::redux_abs_max_nan_propagation_sync_warp<ElementCompute>{}(max);
-      }
-      else if constexpr (SFVecSize == 16) {
-        return cutlass::redux_abs_max_nan_propagation_sync_warp_t0t15_t16t31<ElementCompute>{}(max);
+      if constexpr (SFVecSize == 16 || SFVecSize == 32) {
+        return cutlass::redux_abs_max_nan_propagation_sync<ElementCompute, SFVecSize>{}(max);
       }
       else if constexpr (SFVecSize == 64) {
         // Get abs_max per warp
-        auto abs_max = cutlass::redux_abs_max_nan_propagation_sync_warp<ElementCompute>{}(max);
+        auto abs_max = cutlass::redux_abs_max_nan_propagation_sync<ElementCompute, 32>{}(max);
 
         // Switch the amax of adjacent warps
         const bool leading_thread = (threadIdx.x % NumThreadsPerWarp) == 0;

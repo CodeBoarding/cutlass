@@ -34,6 +34,9 @@
 
 #include "../common/cutlass_unit_test.h"
 
+#include <cmath>
+#include <limits>
+
 #include "cutlass/functional.h"
 #include "cutlass/core_io.h"
 
@@ -566,3 +569,140 @@ TEST(FUnction, maximum_half_device) {
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace test {
+namespace core {
+namespace kernel {
+
+template <typename Operator>
+__global__ void warp_abs_max(float *output, float const *input) {
+  int thread = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+  int idx = blockIdx.x * (blockDim.x * blockDim.y * blockDim.z) + thread;
+  output[idx] = Operator{}(input[idx]);
+}
+
+} // namespace kernel
+
+/// Check every lane, not only lane zero: the public functors promise a broadcast result.
+template <int Width, typename Operator>
+void check_warp_abs_max(dim3 block = dim3(64)) {
+  using Tensor = cutlass::HostTensor<float, cutlass::layout::RowMajor>;
+  constexpr int count = 128;
+  Tensor input({1, count});
+  Tensor output({1, count});
+
+  // Distinct magnitudes and signs distinguish neighboring half-warps, warps, and blocks.
+  // Move the maximum through every position to catch a missing shuffle stage.
+  for (int peak = 0; peak < Width; ++peak) {
+    for (int i = 0; i < count; ++i) {
+      input.host_data()[i] = float((i % 7) - 3);
+      if (i % Width == peak) {
+        input.host_data()[i] = -float(100 + i / Width);
+      }
+    }
+    input.sync_device();
+    kernel::warp_abs_max<Operator><<<2, block>>>(output.device_data(), input.device_data());
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    output.sync_host();
+    for (int i = 0; i < count; ++i) {
+      EXPECT_EQ(output.host_data()[i], float(100 + i / Width)) << "lane " << i;
+    }
+  }
+
+  // A NaN in either half must propagate only within its reduction group.
+  for (int nan_lane = 0; nan_lane < 32; ++nan_lane) {
+    for (int i = 0; i < count; ++i) {
+      input.host_data()[i] = -float(i + 1);
+    }
+    input.host_data()[nan_lane] = std::numeric_limits<float>::quiet_NaN();
+    input.sync_device();
+    kernel::warp_abs_max<Operator><<<2, block>>>(output.device_data(), input.device_data());
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    output.sync_host();
+    for (int i = 0; i < count; ++i) {
+      if (i / Width == nan_lane / Width) {
+        EXPECT_TRUE(std::isnan(output.host_data()[i])) << "lane " << i;
+      }
+      else {
+        EXPECT_EQ(output.host_data()[i], float((i / Width + 1) * Width)) << "lane " << i;
+      }
+    }
+  }
+
+  // Alternate negative infinity and signed zeros in adjacent groups.
+  for (int i = 0; i < count; ++i) {
+    input.host_data()[i] = i % 2 ? -0.0f : 0.0f;
+    if (i % (2 * Width) == Width - 1) {
+      input.host_data()[i] = -std::numeric_limits<float>::infinity();
+    }
+  }
+  input.sync_device();
+  kernel::warp_abs_max<Operator><<<2, block>>>(output.device_data(), input.device_data());
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  output.sync_host();
+  for (int i = 0; i < count; ++i) {
+    float expected = (i / Width) % 2 ? 0.0f : std::numeric_limits<float>::infinity();
+    EXPECT_EQ(output.host_data()[i], expected) << "lane " << i;
+    EXPECT_FALSE(std::signbit(output.host_data()[i])) << "lane " << i;
+  }
+
+  // Preserve subnormals; an absolute-max reduction must not silently flush them to zero.
+  for (int i = 0; i < count; ++i) {
+    input.host_data()[i] = -std::numeric_limits<float>::denorm_min() * float(i + 1);
+  }
+  input.sync_device();
+  kernel::warp_abs_max<Operator><<<2, block>>>(output.device_data(), input.device_data());
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  output.sync_host();
+  for (int i = 0; i < count; ++i) {
+    float expected = std::numeric_limits<float>::denorm_min() * float((i / Width + 1) * Width);
+    EXPECT_EQ(output.host_data()[i], expected) << "lane " << i;
+  }
+}
+
+template <int Width>
+void check_warp_abs_max_block_shapes() {
+  using Operator = cutlass::redux_abs_max_nan_propagation_sync<float, Width>;
+  check_warp_abs_max<Width, Operator>(dim3(64));
+  check_warp_abs_max<Width, Operator>(dim3(8, 8));
+  check_warp_abs_max<Width, Operator>(dim3(4, 4, 4));
+}
+
+} // namespace core
+} // namespace test
+
+TEST(Functional, warp_abs_max_nan) {
+  test::core::check_warp_abs_max<32, cutlass::redux_abs_max_nan_propagation_sync_warp<float>>();
+}
+
+TEST(Functional, half_warp_abs_max_nan) {
+  test::core::check_warp_abs_max<16, cutlass::redux_abs_max_nan_propagation_sync_warp_t0t15_t16t31<float>>();
+}
+
+TEST(Functional, subgroup_abs_max_nan_width1) {
+  test::core::check_warp_abs_max_block_shapes<1>();
+}
+
+TEST(Functional, subgroup_abs_max_nan_width2) {
+  test::core::check_warp_abs_max_block_shapes<2>();
+}
+
+TEST(Functional, subgroup_abs_max_nan_width4) {
+  test::core::check_warp_abs_max_block_shapes<4>();
+}
+
+TEST(Functional, subgroup_abs_max_nan_width8) {
+  test::core::check_warp_abs_max_block_shapes<8>();
+}
+
+TEST(Functional, subgroup_abs_max_nan_width16) {
+  test::core::check_warp_abs_max_block_shapes<16>();
+}
+
+TEST(Functional, subgroup_abs_max_nan_width32) {
+  test::core::check_warp_abs_max_block_shapes<32>();
+}
